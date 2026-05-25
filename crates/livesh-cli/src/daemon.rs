@@ -21,6 +21,7 @@ use livesh_core::{
     limits::{BoundedBytes, EventRing},
     metadata::{StateMetadata, write_metadata},
     paths::{RuntimePaths, ensure_runtime_dirs},
+    shell_cwd,
     terminal_model::TerminalModel,
 };
 use livesh_protocol::{
@@ -420,6 +421,7 @@ impl ShellRegistry {
         self.persist_metadata(&state)?;
         self.spawn_reader(state.clone(), reader);
         self.spawn_waiter(id.clone(), state.clone(), child);
+        self.spawn_cwd_poller(state.clone());
 
         Ok((
             id.clone(),
@@ -455,6 +457,42 @@ impl ShellRegistry {
         std::thread::spawn(move || {
             let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
             registry.cleanup_shell(&id, exit_code);
+        });
+    }
+
+    fn spawn_cwd_poller(self: &Arc<Self>, state: Arc<ShellState>) {
+        let Some(pid) = state.pid else {
+            return;
+        };
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                if !matches!(*state.status.lock(), ShellStatus::Running) {
+                    break;
+                }
+                let Some(new_cwd) = shell_cwd::read_cwd(pid) else {
+                    continue;
+                };
+                let changed = {
+                    let mut cur = state.cwd.lock();
+                    if *cur == new_cwd {
+                        false
+                    } else {
+                        *cur = new_cwd.clone();
+                        true
+                    }
+                };
+                if !changed {
+                    continue;
+                }
+                let attach = state.attach.lock();
+                if let Some(attach) = attach.as_ref() {
+                    let _ = attach.tx.send(ServerMsg::CwdChanged {
+                        attach_id: attach.id.clone(),
+                        cwd: new_cwd,
+                    });
+                }
+            }
         });
     }
 
@@ -578,7 +616,7 @@ impl ShellRegistry {
             id: state.id.clone(),
             name: state.name.lock().clone(),
             status: *state.status.lock(),
-            cwd: state.cwd.display().to_string(),
+            cwd: state.cwd.lock().display().to_string(),
             shell_path: state.shell_path.display().to_string(),
             daemon_id: self.daemon_id.clone(),
             created_at_ms: state.created_at_ms as u128,
@@ -634,7 +672,7 @@ struct ShellState {
     name: Mutex<String>,
     status: Mutex<ShellStatus>,
     shell_path: PathBuf,
-    cwd: PathBuf,
+    cwd: Mutex<PathBuf>,
     created_at_ms: u64,
     last_active_at_ms: AtomicU64,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
@@ -665,7 +703,7 @@ impl ShellState {
             name: Mutex::new(name),
             status: Mutex::new(ShellStatus::Running),
             shell_path,
-            cwd,
+            cwd: Mutex::new(cwd),
             created_at_ms: now,
             last_active_at_ms: AtomicU64::new(now),
             master: Mutex::new(Some(master)),
@@ -709,6 +747,10 @@ impl ShellState {
             name,
             status,
             screen_bytes,
+        });
+        let _ = tx.send(ServerMsg::CwdChanged {
+            attach_id: attach_id.clone(),
+            cwd: self.cwd.lock().clone(),
         });
         *attach = Some(Attach {
             id: attach_id.clone(),
@@ -834,7 +876,7 @@ impl ShellState {
             id: self.id.clone(),
             name: self.name.lock().clone(),
             status: *self.status.lock(),
-            cwd: self.cwd.clone(),
+            cwd: self.cwd.lock().clone(),
             shell_path: self.shell_path.clone(),
             created_at_ms: self.created_at_ms as u128,
             last_active_at_ms: self.last_active_at_ms.load(Ordering::Relaxed) as u128,

@@ -108,6 +108,12 @@ async fn output_loop(client: Client, attach_id: AttachId) -> anyhow::Result<i32>
             ServerMsg::DetachedByAnotherClient { attach_id: old } if old == attach_id => {
                 return Ok(0);
             }
+            ServerMsg::CwdChanged {
+                attach_id: msg_attach,
+                cwd,
+            } if msg_attach == attach_id => {
+                let _ = std::env::set_current_dir(&cwd);
+            }
             ServerMsg::Error { code, message } => {
                 bail!("{code:?}: {message}");
             }

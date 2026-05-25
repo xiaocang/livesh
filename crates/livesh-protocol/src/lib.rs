@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,6 +158,10 @@ pub enum ServerMsg {
     },
     DetachedByAnotherClient {
         attach_id: AttachId,
+    },
+    CwdChanged {
+        attach_id: AttachId,
+        cwd: PathBuf,
     },
     ShellList {
         shells: Vec<ShellInfo>,
