@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, bail};
 use livesh_protocol::ShellId;
@@ -8,6 +8,7 @@ pub enum LiveshMode {
     New {
         name: Option<String>,
         state_json_fd: Option<i32>,
+        cwd: Option<PathBuf>,
     },
     Open {
         id: ShellId,
@@ -36,6 +37,7 @@ where
     let _program = args.next();
     let mut name = None;
     let mut state_json_fd = None;
+    let mut cwd: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy();
@@ -62,6 +64,10 @@ where
                     .context("invalid --state-json-fd value")?;
                 state_json_fd = Some(fd);
             }
+            "--cwd" => {
+                let value = args.next().context("--cwd requires a directory path")?;
+                cwd = Some(PathBuf::from(value));
+            }
             unknown => bail!("unknown livesh argument: {unknown}"),
         }
     }
@@ -69,6 +75,7 @@ where
     Ok(LiveshMode::New {
         name,
         state_json_fd,
+        cwd,
     })
 }
 
@@ -114,7 +121,7 @@ where
 }
 
 pub fn livesh_help() -> &'static str {
-    "usage: livesh [--name <name>] [--state-json-fd <fd>]\n       livesh --open <sh_id>\n       livesh --real\n"
+    "usage: livesh [--name <name>] [--cwd <dir>] [--state-json-fd <fd>]\n       livesh --open <sh_id>\n       livesh --real\n"
 }
 
 pub fn liveshctl_help() -> &'static str {
@@ -131,14 +138,25 @@ mod tests {
 
     #[test]
     fn parses_new_livesh_options() {
-        let mode = parse_livesh(os(&["livesh", "--name", "dev", "--state-json-fd", "3"])).unwrap();
+        let mode = parse_livesh(os(&[
+            "livesh",
+            "--name",
+            "dev",
+            "--cwd",
+            "/repo",
+            "--state-json-fd",
+            "3",
+        ]))
+        .unwrap();
         match mode {
             LiveshMode::New {
                 name,
                 state_json_fd,
+                cwd,
             } => {
                 assert_eq!(name.as_deref(), Some("dev"));
                 assert_eq!(state_json_fd, Some(3));
+                assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/repo")));
             }
             other => panic!("unexpected mode: {other:?}"),
         }

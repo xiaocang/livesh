@@ -24,9 +24,12 @@ pub struct RuntimePaths {
 
 impl RuntimePaths {
     pub fn resolve() -> Self {
-        let base = match std::env::var_os("XDG_RUNTIME_DIR") {
-            Some(dir) => PathBuf::from(dir).join("livesh"),
-            None => PathBuf::from("/tmp").join(format!("livesh-{}", Uid::current().as_raw())),
+        let base = if let Some(dir) = std::env::var_os("LIVESH_RUNTIME_DIR") {
+            PathBuf::from(dir)
+        } else if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            PathBuf::from(dir).join("livesh")
+        } else {
+            PathBuf::from("/tmp").join(format!("livesh-{}", Uid::current().as_raw()))
         };
 
         Self {

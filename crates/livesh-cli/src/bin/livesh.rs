@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, os::unix::process::CommandExt, process::Command};
 
 use anyhow::Context;
 use livesh_cli::{
@@ -9,6 +9,8 @@ use livesh_cli::{
 };
 use livesh_core::shell_resolve;
 use livesh_protocol::ClientKind;
+
+const REEXEC_GUARD_ENV: &str = "LIVESH_INTERNAL_NO_REEXEC";
 
 #[tokio::main]
 async fn main() {
@@ -40,6 +42,7 @@ async fn run() -> anyhow::Result<i32> {
         LiveshMode::New {
             name,
             state_json_fd,
+            cwd,
         } => {
             let force_live = env::var_os("LIVESH_FORCE_LIVE").is_some();
             if !force_live && !tty::stdin_stdout_are_tty() {
@@ -50,7 +53,10 @@ async fn run() -> anyhow::Result<i32> {
             let config = livesh_core::config::Config::load()?;
             let shell_path =
                 shell_resolve::resolve_real_shell_with_config(Some(&config.real_shell))?;
-            let cwd = env::current_dir().context("current directory")?;
+            let cwd = match cwd {
+                Some(path) => path,
+                None => env::current_dir().context("current directory")?,
+            };
             let env = shell_resolve::filtered_current_env();
             let size = tty::current_size();
             let created = client
@@ -59,6 +65,19 @@ async fn run() -> anyhow::Result<i32> {
 
             if let Some(fd) = state_json_fd {
                 state_json::write(fd, &created.id, &created.name, &created.restore_argv)?;
+            }
+
+            if env::var_os(REEXEC_GUARD_ENV).is_none() {
+                drop(client);
+                let exe = env::current_exe().context("resolve current_exe for reexec")?;
+                let id = created.id.to_string();
+                let err = Command::new(&exe)
+                    .arg("--open")
+                    .arg(&id)
+                    .env(REEXEC_GUARD_ENV, "1")
+                    .exec();
+                return Err(anyhow::Error::from(err))
+                    .with_context(|| format!("reexec {} --open {}", exe.display(), id));
             }
 
             bridge::open_and_bridge(client, created.id).await
