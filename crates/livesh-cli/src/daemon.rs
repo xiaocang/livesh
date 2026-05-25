@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::framing;
 
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(strip_prefix_env: Vec<String>) -> anyhow::Result<()> {
     let paths = RuntimePaths::resolve();
     ensure_runtime_dirs(&paths)?;
     let lock = daemon_lock(&paths)?;
@@ -61,7 +61,12 @@ pub async fn run() -> anyhow::Result<()> {
 
     let daemon_id = format!("daemon_{}", Uuid::new_v4().simple());
     write_daemon_json(&paths, &daemon_id).ok();
-    let registry = Arc::new(ShellRegistry::new(paths.clone(), config, daemon_id.clone()));
+    let registry = Arc::new(ShellRegistry::new(
+        paths.clone(),
+        config,
+        daemon_id.clone(),
+        strip_prefix_env,
+    ));
     spawn_periodic_gc(registry.clone());
 
     let listener = UnixListener::bind(&paths.socket)
@@ -357,15 +362,22 @@ struct ShellRegistry {
     paths: RuntimePaths,
     config: Config,
     daemon_id: String,
+    strip_prefix_env: Vec<String>,
 }
 
 impl ShellRegistry {
-    fn new(paths: RuntimePaths, config: Config, daemon_id: String) -> Self {
+    fn new(
+        paths: RuntimePaths,
+        config: Config,
+        daemon_id: String,
+        strip_prefix_env: Vec<String>,
+    ) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
             paths,
             config,
             daemon_id,
+            strip_prefix_env,
         }
     }
 
@@ -395,7 +407,21 @@ impl ShellRegistry {
         let mut cmd = CommandBuilder::new(&shell_path);
         cmd.cwd(&cwd);
         for (key, value) in env {
+            if matches_strip_prefix(&key, &self.strip_prefix_env) {
+                continue;
+            }
             cmd.env(key, value);
+        }
+        if !self.strip_prefix_env.is_empty() {
+            let to_remove: Vec<String> = cmd
+                .iter_full_env_as_str()
+                .filter_map(|(key, _)| {
+                    matches_strip_prefix(key, &self.strip_prefix_env).then(|| key.to_string())
+                })
+                .collect();
+            for key in to_remove {
+                cmd.env_remove(&key);
+            }
         }
 
         let child = pair.slave.spawn_command(cmd)?;
@@ -885,9 +911,87 @@ impl ShellState {
     }
 }
 
+fn matches_strip_prefix(key: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| !prefix.is_empty() && key.starts_with(prefix.as_str()))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_only_real_prefix() {
+        let prefixes = vec!["CMUX_".to_string(), "FOO_".to_string()];
+        assert!(matches_strip_prefix("CMUX_SESSION", &prefixes));
+        assert!(matches_strip_prefix("FOO_BAR", &prefixes));
+        assert!(!matches_strip_prefix("CMUX", &prefixes));
+        assert!(!matches_strip_prefix("MY_CMUX_", &prefixes));
+        assert!(!matches_strip_prefix("PATH", &prefixes));
+    }
+
+    #[test]
+    fn empty_prefix_list_strips_nothing() {
+        assert!(!matches_strip_prefix("CMUX_X", &[]));
+    }
+
+    #[test]
+    fn empty_prefix_string_is_ignored() {
+        let prefixes = vec![String::new()];
+        assert!(!matches_strip_prefix("CMUX_X", &prefixes));
+        assert!(!matches_strip_prefix("", &prefixes));
+    }
+
+    #[test]
+    fn command_builder_strips_inherited_and_explicit_env() {
+        unsafe {
+            std::env::set_var("CMUX_FROM_DAEMON_ENV", "leaked");
+        }
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        let prefixes = vec!["CMUX_".to_string()];
+
+        let client_env = vec![
+            ("CMUX_FROM_CLIENT".to_string(), "leaked".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        for (key, value) in client_env {
+            if matches_strip_prefix(&key, &prefixes) {
+                continue;
+            }
+            cmd.env(key, value);
+        }
+        let to_remove: Vec<String> = cmd
+            .iter_full_env_as_str()
+            .filter_map(|(key, _)| {
+                matches_strip_prefix(key, &prefixes).then(|| key.to_string())
+            })
+            .collect();
+        for key in to_remove {
+            cmd.env_remove(&key);
+        }
+
+        let env: Vec<(String, String)> = cmd
+            .iter_full_env_as_str()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert!(
+            !env.iter().any(|(k, _)| k.starts_with("CMUX_")),
+            "expected no CMUX_* in env, got: {:?}",
+            env.iter().filter(|(k, _)| k.starts_with("CMUX_")).collect::<Vec<_>>()
+        );
+        assert!(env.iter().any(|(k, v)| k == "PATH" && v == "/usr/bin"));
+
+        unsafe {
+            std::env::remove_var("CMUX_FROM_DAEMON_ENV");
+        }
+    }
 }
