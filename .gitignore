@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# Coverage
+/coverage/
+*.lcov
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Claude
+.claude/
+
+# Internal design doc — not for public release
+plan.md

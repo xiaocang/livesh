@@ -1,0 +1,15 @@
+[package]
+name = "livesh-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+livesh-protocol = { path = "../livesh-protocol" }
+nix.workspace = true
+parking_lot.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

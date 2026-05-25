@@ -1,0 +1,31 @@
+[package]
+name = "livesh-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "livesh"
+path = "src/bin/livesh.rs"
+
+[[bin]]
+name = "liveshd"
+path = "src/bin/liveshd.rs"
+
+[[bin]]
+name = "liveshctl"
+path = "src/bin/liveshctl.rs"
+
+[dependencies]
+anyhow.workspace = true
+livesh-core = { path = "../livesh-core" }
+livesh-protocol = { path = "../livesh-protocol" }
+nix.workspace = true
+parking_lot.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
