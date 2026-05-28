@@ -83,6 +83,21 @@ liveshctl status
 The daemon (`liveshd`) is spawned on demand by the client; you don't normally
 run it by hand.
 
+## Detecting livesh from inside the shell
+
+The daemon sets `LIVESH_SHELL_ID` in the inner shell's environment to the
+session id (e.g. `sh_5f0c…`). This is a stable contract — child processes can
+test for the variable to detect that they're running under livesh, and the
+value is a valid argument for `livesh --open` / `liveshctl` commands. The
+variable is set after `LIVESH_STRIP_PREFIX_ENV` filtering, so it cannot be
+inadvertently stripped.
+
+```bash
+if [[ -n "$LIVESH_SHELL_ID" ]]; then
+  echo "inside livesh session $LIVESH_SHELL_ID"
+fi
+```
+
 ## Stripping env vars from the inner shell
 
 Hosts like cmux inject identifying env vars (`CMUX_*`, etc.) into every pane.

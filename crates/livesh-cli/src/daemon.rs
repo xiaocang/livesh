@@ -423,6 +423,7 @@ impl ShellRegistry {
                 cmd.env_remove(&key);
             }
         }
+        cmd.env("LIVESH_SHELL_ID", id.as_str());
 
         let child = pair.slave.spawn_command(cmd)?;
         let pid = child.process_id().map(|pid| pid as i32);
