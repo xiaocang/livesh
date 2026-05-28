@@ -56,11 +56,18 @@ make install PREFIX=/usr/local
 ## Usage
 
 ```bash
-# Create a new live shell and attach the current terminal to it
+# Create a new live shell and attach the current terminal to it.
+# If liveshd is unreachable, livesh transparently exec's your real shell
+# instead of erroring out.
 livesh
 
 # Reattach to an existing session
 livesh --open sh_<uuid>
+
+# Upgrade a fallback (real-shell) terminal back into a managed session.
+# Same as plain `livesh`, but errors loudly if the daemon is still down —
+# use this when you explicitly want managed mode.
+livesh upgrade
 
 # Bypass live mode and exec the real default shell directly
 livesh --real
@@ -76,12 +83,31 @@ Manage sessions:
 liveshctl list [--json]
 liveshctl rename <sh_id> <name>
 liveshctl kill <sh_id>
-liveshctl gc
+liveshctl gc                              # also reaps dead-pid shells
 liveshctl status
+liveshctl upgrade-daemon [<new-binary>]   # hot-swap liveshd in place
 ```
 
 The daemon (`liveshd`) is spawned on demand by the client; you don't normally
 run it by hand.
+
+## Hot-upgrading the daemon
+
+`liveshctl upgrade-daemon [<new-binary>]` swaps the running `liveshd` for a
+new binary without losing live sessions. With no argument it re-execs the
+current binary path (handy after `make install`). Bridge clients (`livesh
+--open`) reconnect on next use.
+
+## Out of fds
+
+If too many live shells exhaust the process fd limit, `livesh` will prompt
+to kill detached shells, starting with the oldest:
+
+1. `Kill detached shells idle for >3d? [y/N]`
+2. `Kill detached shells idle for >1d? [y/N]`
+3. `Kill ALL detached sessions? [y/N]`
+
+Answer `y` to free fds and continue, `n` to abort.
 
 ## Detecting livesh from inside the shell
 

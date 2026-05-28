@@ -57,6 +57,26 @@ async fn run() -> anyhow::Result<()> {
             println!("liveshd ok ({})", client.daemon_id);
             Ok(())
         }
+        LiveshctlMode::UpgradeDaemon { binary } => {
+            let client = Client::connect_or_spawn(ClientKind::Liveshctl).await?;
+            client
+                .expect_ok(ClientMsg::UpgradeDaemon {
+                    binary: binary.clone(),
+                })
+                .await?;
+            // The daemon execs in place, so the socket flaps briefly.
+            // Wait for it to come back and confirm via ping.
+            for _ in 0..200 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                if let Ok(client) = Client::connect_or_spawn(ClientKind::Liveshctl).await {
+                    if client.ping().await.is_ok() {
+                        println!("liveshd upgraded ({})", client.daemon_id);
+                        return Ok(());
+                    }
+                }
+            }
+            anyhow::bail!("liveshd did not come back after upgrade");
+        }
     }
 }
 

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +70,9 @@ pub enum ErrorCode {
     TemporaryFailure,
     TooManyShells,
     ProtocolMismatch,
+    /// Per-process file descriptor limit reached while creating a shell.
+    /// Client may retry after killing some shells.
+    FdLimit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +131,16 @@ pub enum ClientMsg {
         id: ShellId,
     },
     RunGc,
+    /// Kill detached shells whose last activity was at least `older_than_ms`
+    /// milliseconds ago. Use `0` to kill every detached shell.
+    KillIdleDetached {
+        older_than_ms: u64,
+    },
+    /// Replace the running liveshd binary in place via execv, keeping fds
+    /// and child PIDs. If `binary` is None, re-exec the daemon's own path.
+    UpgradeDaemon {
+        binary: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -22,6 +22,11 @@ pub struct StateMetadata {
     pub last_active_at_ms: u128,
 }
 
+pub fn read_metadata(path: &Path) -> anyhow::Result<StateMetadata> {
+    let bytes = fs::read(path).with_context(|| format!("read metadata {}", path.display()))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 pub fn write_metadata(path: &Path, metadata: &StateMetadata) -> anyhow::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(metadata)?;

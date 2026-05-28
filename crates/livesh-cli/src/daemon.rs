@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
+        io::{AsRawFd, FromRawFd, RawFd},
     },
     path::PathBuf,
     sync::{
@@ -19,7 +19,7 @@ use livesh_core::{
     config::Config,
     gc,
     limits::{BoundedBytes, EventRing},
-    metadata::{StateMetadata, write_metadata},
+    metadata::{StateMetadata, read_metadata, write_metadata},
     paths::{RuntimePaths, ensure_runtime_dirs},
     shell_cwd,
     terminal_model::TerminalModel,
@@ -34,7 +34,7 @@ use nix::{
     unistd::{Pid, Uid},
 };
 use parking_lot::Mutex;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::mpsc::{self, UnboundedSender},
@@ -42,47 +42,96 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::framing;
+use crate::{
+    framing,
+    pty_master::{OwnedPtyMaster, OwnedReader, clear_cloexec},
+    takeover,
+};
 
 pub async fn run(strip_prefix_env: Vec<String>) -> anyhow::Result<()> {
+    raise_nofile_limit(NOFILE_TARGET);
+
     let paths = RuntimePaths::resolve();
     ensure_runtime_dirs(&paths)?;
-    let lock = daemon_lock(&paths)?;
-    let _lock = lock;
+    let _lock = daemon_lock(&paths)?;
 
-    if paths.socket.exists() {
-        let _ = fs::remove_file(&paths.socket);
-    }
+    let takeover_result = takeover::read_env();
+    let takeover_manifest = match takeover_result {
+        Some(Ok(m)) => Some(m),
+        Some(Err(err)) => {
+            eprintln!("liveshd: ignoring malformed LIVESH_TAKEOVER: {err}");
+            None
+        }
+        None => None,
+    };
+    takeover::clear_env();
 
     let config = Config::load()?;
-    if config.cleanup_lost_on_startup {
+    if takeover_manifest.is_none() && config.cleanup_lost_on_startup {
         gc::startup_gc(&paths)?;
     }
 
-    let daemon_id = format!("daemon_{}", Uuid::new_v4().simple());
+    let daemon_id = takeover_manifest
+        .as_ref()
+        .map(|m| m.daemon_id.clone())
+        .unwrap_or_else(|| format!("daemon_{}", Uuid::new_v4().simple()));
     write_daemon_json(&paths, &daemon_id).ok();
+
+    let (upgrade_tx, mut upgrade_rx) = mpsc::unbounded_channel::<UpgradeRequest>();
     let registry = Arc::new(ShellRegistry::new(
         paths.clone(),
         config,
         daemon_id.clone(),
         strip_prefix_env,
+        upgrade_tx,
     ));
     spawn_periodic_gc(registry.clone());
 
-    let listener = UnixListener::bind(&paths.socket)
-        .with_context(|| format!("bind {}", paths.socket.display()))?;
-    let _ = fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600));
+    let listener = match &takeover_manifest {
+        Some(manifest) => adopt_listener(manifest.listener_fd)?,
+        None => {
+            if paths.socket.exists() {
+                let _ = fs::remove_file(&paths.socket);
+            }
+            let l = UnixListener::bind(&paths.socket)
+                .with_context(|| format!("bind {}", paths.socket.display()))?;
+            let _ = fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600));
+            l
+        }
+    };
+
+    if let Some(manifest) = takeover_manifest {
+        registry.adopt_shells(&manifest)?;
+    }
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let registry = registry.clone();
-        let daemon_id = daemon_id.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, registry, daemon_id).await {
-                eprintln!("liveshd client error: {err:#}");
+        tokio::select! {
+            biased;
+            request = upgrade_rx.recv() => {
+                let Some(request) = request else { return Ok(()); };
+                return registry.perform_upgrade(listener, request).await;
             }
-        });
+            accept = listener.accept() => {
+                let (stream, _) = accept?;
+                let registry = registry.clone();
+                let daemon_id = daemon_id.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_client(stream, registry, daemon_id).await {
+                        eprintln!("liveshd client error: {err:#}");
+                    }
+                });
+            }
+        }
     }
+}
+
+fn adopt_listener(fd: RawFd) -> anyhow::Result<UnixListener> {
+    let std_listener =
+        unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    std_listener
+        .set_nonblocking(true)
+        .context("set adopted listener non-blocking")?;
+    UnixListener::from_std(std_listener).context("wrap adopted listener into tokio")
 }
 
 #[allow(deprecated)]
@@ -118,11 +167,41 @@ fn write_daemon_json(paths: &RuntimePaths, daemon_id: &str) -> anyhow::Result<()
     Ok(())
 }
 
+const NOFILE_TARGET: libc::rlim_t = 8192;
+
+fn raise_nofile_limit(target: libc::rlim_t) {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    if limit.rlim_cur >= target {
+        return;
+    }
+    let desired = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max.max(target),
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &desired) } == 0 {
+        return;
+    }
+    // Setting above the hard cap (e.g. macOS kern.maxfilesperproc) failed; fall back to
+    // whatever the kernel will allow up to rlim_max.
+    let fallback = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &fallback) };
+}
+
 fn spawn_periodic_gc(registry: Arc<ShellRegistry>) {
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(300));
         loop {
             interval.tick().await;
+            registry.cleanup_dead_shells();
             registry.prune_storage_caps();
         }
     });
@@ -335,6 +414,18 @@ fn handle_msg(
             send(&tx, ServerMsg::Ok);
             None
         }
+        ClientMsg::KillIdleDetached { older_than_ms } => {
+            registry.kill_idle_detached(older_than_ms);
+            send(&tx, ServerMsg::Ok);
+            None
+        }
+        ClientMsg::UpgradeDaemon { binary } => {
+            match registry.request_upgrade(binary) {
+                Ok(()) => send(&tx, ServerMsg::Ok),
+                Err(err) => send_error(&tx, ErrorCode::Internal, err.to_string()),
+            }
+            None
+        }
     }
 }
 
@@ -348,7 +439,9 @@ fn send_error(tx: &UnboundedSender<ServerMsg>, code: ErrorCode, message: String)
 
 fn classify_error(err: &anyhow::Error) -> ErrorCode {
     let msg = err.to_string();
-    if msg.contains("not found") {
+    if msg.contains("dup of fd") || msg.contains("Too many open files") || msg.contains("EMFILE") {
+        ErrorCode::FdLimit
+    } else if msg.contains("not found") {
         ErrorCode::NotFound
     } else if msg.contains("too many") {
         ErrorCode::TooManyShells
@@ -363,6 +456,12 @@ struct ShellRegistry {
     config: Config,
     daemon_id: String,
     strip_prefix_env: Vec<String>,
+    upgrade_tx: UnboundedSender<UpgradeRequest>,
+}
+
+#[derive(Debug, Clone)]
+struct UpgradeRequest {
+    binary: Option<PathBuf>,
 }
 
 impl ShellRegistry {
@@ -371,6 +470,7 @@ impl ShellRegistry {
         config: Config,
         daemon_id: String,
         strip_prefix_env: Vec<String>,
+        upgrade_tx: UnboundedSender<UpgradeRequest>,
     ) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
@@ -378,7 +478,15 @@ impl ShellRegistry {
             config,
             daemon_id,
             strip_prefix_env,
+            upgrade_tx,
         }
+    }
+
+    fn request_upgrade(&self, binary: Option<PathBuf>) -> anyhow::Result<()> {
+        self.upgrade_tx
+            .send(UpgradeRequest { binary })
+            .map_err(|_| anyhow::anyhow!("upgrade channel closed"))?;
+        Ok(())
     }
 
     fn create_shell(
@@ -428,16 +536,14 @@ impl ShellRegistry {
         let child = pair.slave.spawn_command(cmd)?;
         let pid = child.process_id().map(|pid| pid as i32);
         drop(pair.slave);
-        let master = pair.master;
-        let reader = master.try_clone_reader()?;
-        let writer = master.take_writer()?;
+        let master = OwnedPtyMaster::from_portable(pair.master)?;
+        let reader = master.clone_reader()?;
         let state = Arc::new(ShellState::new(
             id.clone(),
             name.clone(),
             cwd,
             shell_path,
             master,
-            writer,
             pid,
             &self.config,
         ));
@@ -447,7 +553,7 @@ impl ShellRegistry {
             .insert(id.as_str().to_string(), state.clone());
         self.persist_metadata(&state)?;
         self.spawn_reader(state.clone(), reader);
-        self.spawn_waiter(id.clone(), state.clone(), child);
+        self.spawn_child_waiter(id.clone(), child);
         self.spawn_cwd_poller(state.clone());
 
         Ok((
@@ -457,7 +563,7 @@ impl ShellRegistry {
         ))
     }
 
-    fn spawn_reader(self: &Arc<Self>, state: Arc<ShellState>, mut reader: Box<dyn Read + Send>) {
+    fn spawn_reader(self: &Arc<Self>, state: Arc<ShellState>, mut reader: OwnedReader) {
         let registry = self.clone();
         std::thread::spawn(move || {
             let mut buf = [0_u8; 8192];
@@ -474,16 +580,48 @@ impl ShellRegistry {
         });
     }
 
-    fn spawn_waiter(
+    fn spawn_child_waiter(
         self: &Arc<Self>,
         id: ShellId,
-        _state: Arc<ShellState>,
         mut child: Box<dyn Child + Send + Sync>,
     ) {
         let registry = self.clone();
         std::thread::spawn(move || {
             let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
             registry.cleanup_shell(&id, exit_code);
+        });
+    }
+
+    /// Adopted-from-takeover counterpart of `spawn_child_waiter`. The new
+    /// daemon inherited the child PID but not a `portable_pty::Child`,
+    /// so we reap via `waitpid` directly.
+    fn spawn_pid_waiter(self: &Arc<Self>, id: ShellId, pid: i32) {
+        let registry = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                let mut status: libc::c_int = 0;
+                let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if rc == pid {
+                    let exit_code = if libc::WIFEXITED(status) {
+                        Some(libc::WEXITSTATUS(status))
+                    } else if libc::WIFSIGNALED(status) {
+                        Some(-libc::WTERMSIG(status))
+                    } else {
+                        None
+                    };
+                    registry.cleanup_shell(&id, exit_code);
+                    return;
+                }
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if matches!(err.raw_os_error(), Some(libc::EINTR)) {
+                        continue;
+                    }
+                    // ECHILD / EINVAL / etc. — give up, treat as gone.
+                    registry.cleanup_shell(&id, None);
+                    return;
+                }
+            }
         });
     }
 
@@ -598,12 +736,64 @@ impl ShellRegistry {
     }
 
     fn run_gc(&self) {
+        self.cleanup_dead_shells();
         self.prune_storage_caps();
         let live: Vec<String> = self.states.lock().keys().cloned().collect();
         remove_orphans(&self.paths.states, &live, "json");
         remove_orphans(&self.paths.snapshots, &live, "screen");
         remove_orphans(&self.paths.scrollback, &live, "ring");
         remove_orphans(&self.paths.events, &live, "ring");
+    }
+
+    /// Kill every detached shell whose last activity is at least
+    /// `older_than_ms` milliseconds in the past, then GC their files.
+    fn kill_idle_detached(&self, older_than_ms: u64) -> usize {
+        let cutoff = now_ms().saturating_sub(older_than_ms);
+        let victims: Vec<(ShellId, Option<i32>)> = {
+            let states = self.states.lock();
+            states
+                .iter()
+                .filter_map(|(id, state)| {
+                    if state.is_attached() {
+                        return None;
+                    }
+                    if state.last_active_at_ms.load(Ordering::Relaxed) > cutoff {
+                        return None;
+                    }
+                    Some((ShellId::new_unchecked(id.clone()), state.pid))
+                })
+                .collect()
+        };
+        for (id, pid) in &victims {
+            if let Some(pid) = pid {
+                let _ = kill(Pid::from_raw(*pid), Signal::SIGTERM);
+            }
+            self.cleanup_shell(id, None);
+        }
+        victims.len()
+    }
+
+    /// Sweep the registry for shells whose child process has gone away
+    /// without the waiter noticing (e.g. SIGKILL, double-fork, daemon races)
+    /// and free their handles so fds get released.
+    fn cleanup_dead_shells(&self) -> usize {
+        let dead: Vec<ShellId> = {
+            let states = self.states.lock();
+            states
+                .iter()
+                .filter_map(|(id, state)| {
+                    let pid = state.pid?;
+                    if kill(Pid::from_raw(pid), None).is_ok() {
+                        return None;
+                    }
+                    Some(ShellId::new_unchecked(id.clone()))
+                })
+                .collect()
+        };
+        for id in &dead {
+            self.cleanup_shell(id, None);
+        }
+        dead.len()
     }
 
     fn prune_storage_caps(&self) {
@@ -626,6 +816,7 @@ impl ShellRegistry {
             state.mark_exited(exit_code);
             state.close_handles();
             gc::remove_shell_files(&self.paths, id);
+            let _ = fs::remove_file(pid_hint_path(&self.paths, id));
         }
     }
 
@@ -658,6 +849,164 @@ impl ShellRegistry {
         write_private_file(&self.paths.events(&state.id), &state.event_bytes())?;
         Ok(())
     }
+
+    /// Rebuild the registry after the previous daemon execv'd into us.
+    /// Master fds were left open with CLOEXEC cleared and are listed in
+    /// the takeover manifest; per-shell replay state lives on disk.
+    fn adopt_shells(self: &Arc<Self>, manifest: &takeover::Manifest) -> anyhow::Result<()> {
+        for handoff in &manifest.shells {
+            if let Err(err) = self.adopt_one(handoff) {
+                eprintln!(
+                    "liveshd: dropping shell {} during takeover: {err:#}",
+                    handoff.id
+                );
+                // Best-effort: close the orphan fd so we don't leak.
+                unsafe { libc::close(handoff.master_fd) };
+                gc::remove_shell_files(&self.paths, &ShellId::new_unchecked(handoff.id.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    fn adopt_one(self: &Arc<Self>, handoff: &takeover::ShellHandoff) -> anyhow::Result<()> {
+        let id = ShellId::new_unchecked(handoff.id.clone());
+        let metadata_path = self.paths.metadata(&id);
+        let metadata: StateMetadata = read_metadata(&metadata_path)
+            .with_context(|| format!("read metadata for {id}"))?;
+        let master = unsafe { OwnedPtyMaster::from_raw_fd(handoff.master_fd) };
+        let pid = (metadata.created_at_ms != 0)
+            .then_some(read_pid_hint(&self.paths, &id))
+            .flatten();
+        let reader = master.clone_reader().context("dup adopted master")?;
+
+        let state = Arc::new(ShellState::adopt(
+            id.clone(),
+            metadata,
+            master,
+            pid,
+            &self.paths,
+            &self.config,
+        )?);
+        self.states.lock().insert(id.as_str().to_string(), state.clone());
+        // Refresh metadata with the new daemon id so peers can tell who owns the shell now.
+        self.persist_metadata(&state).ok();
+        self.spawn_reader(state.clone(), reader);
+        if let Some(pid) = pid {
+            self.spawn_pid_waiter(id.clone(), pid);
+        }
+        self.spawn_cwd_poller(state);
+        Ok(())
+    }
+
+    /// Persist final state and `execv` the new binary in place. Listener
+    /// fd and master fds get FD_CLOEXEC cleared so they survive across
+    /// the exec; everything else dies and the new daemon reconstructs.
+    async fn perform_upgrade(
+        self: &Arc<Self>,
+        listener: UnixListener,
+        request: UpgradeRequest,
+    ) -> anyhow::Result<()> {
+        // 1. Flush every shell's replay state to disk under the locks. The
+        //    reader threads might still write a bit more after this, which
+        //    we accept as a small data-loss window across the execv.
+        let states: Vec<Arc<ShellState>> = self.states.lock().values().cloned().collect();
+        for state in &states {
+            self.persist_metadata(state).ok();
+            self.persist_replay_files(state).ok();
+        }
+
+        // 2. Build the takeover manifest. Master fds first get CLOEXEC
+        //    cleared; otherwise execv would close them.
+        let mut shells = Vec::with_capacity(states.len());
+        for state in &states {
+            let guard = state.master.lock();
+            let Some(master) = guard.as_ref() else { continue; };
+            if let Err(err) = master.clear_cloexec() {
+                eprintln!(
+                    "liveshd: skipping shell {} during upgrade (clear_cloexec: {err})",
+                    state.id
+                );
+                continue;
+            }
+            if let Some(pid) = state.pid {
+                write_pid_hint(&self.paths, &state.id, pid).ok();
+            }
+            shells.push(takeover::ShellHandoff {
+                id: state.id.as_str().to_string(),
+                master_fd: master.as_raw_fd(),
+            });
+        }
+
+        // 3. Listener fd: convert tokio listener to std + clear CLOEXEC so
+        //    the new daemon can adopt the same bound socket.
+        let std_listener = listener.into_std().context("tokio listener into std")?;
+        let listener_fd: RawFd = std_listener.as_raw_fd();
+        clear_cloexec(listener_fd).context("clear cloexec on listener")?;
+        // Forget the std listener so its Drop doesn't close the fd.
+        std::mem::forget(std_listener);
+
+        let manifest = takeover::Manifest {
+            schema: 1,
+            listener_fd,
+            runtime_dir: self.paths.base.clone(),
+            daemon_id: self.daemon_id.clone(),
+            shells,
+        };
+
+        // 4. Resolve the new binary path. Default to current_exe() so a
+        //    rebuild of the same file works out of the box.
+        let binary = match request.binary {
+            Some(path) => path,
+            None => std::env::current_exe().context("resolve current liveshd binary")?,
+        };
+        if !binary.exists() {
+            anyhow::bail!("upgrade target {} does not exist", binary.display());
+        }
+
+        // 5. execv. argv[0] = original program name so /proc-style tools
+        //    still see "liveshd".
+        let original_argv: Vec<std::ffi::CString> = std::env::args_os()
+            .map(|a| std::ffi::CString::new(a.into_encoded_bytes()).unwrap_or_default())
+            .collect();
+        let argv_cstr = if original_argv.is_empty() {
+            vec![std::ffi::CString::new("liveshd").unwrap()]
+        } else {
+            original_argv
+        };
+        let argv: Vec<&std::ffi::CStr> = argv_cstr.iter().map(|c| c.as_c_str()).collect();
+        let binary_cstr = std::ffi::CString::new(binary.as_os_str().as_encoded_bytes())
+            .context("binary path contains NUL")?;
+
+        // 6. Encode manifest into env. Use unsafe set_var because execvp
+        //    inherits the environment from the parent process.
+        let payload = takeover::encode(&manifest);
+        unsafe { std::env::set_var(takeover::TAKEOVER_ENV, &payload) };
+
+        let err = nix::unistd::execv(&binary_cstr, &argv);
+        // execv only returns on failure; if we get here the new binary is
+        // broken and we still hold all the fds.
+        unsafe { std::env::remove_var(takeover::TAKEOVER_ENV) };
+        Err(anyhow::anyhow!(
+            "execv {} failed: {:?}",
+            binary.display(),
+            err
+        ))
+    }
+}
+
+fn pid_hint_path(paths: &RuntimePaths, id: &ShellId) -> PathBuf {
+    paths.states.join(format!("{}.pid", id.as_str()))
+}
+
+fn write_pid_hint(paths: &RuntimePaths, id: &ShellId, pid: i32) -> std::io::Result<()> {
+    let path = pid_hint_path(paths, id);
+    fs::write(path, pid.to_string())
+}
+
+fn read_pid_hint(paths: &RuntimePaths, id: &ShellId) -> Option<i32> {
+    let path = pid_hint_path(paths, id);
+    let raw = fs::read_to_string(path).ok()?;
+    raw.trim().parse().ok()
 }
 
 fn write_private_file(path: &PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
@@ -702,8 +1051,7 @@ struct ShellState {
     cwd: Mutex<PathBuf>,
     created_at_ms: u64,
     last_active_at_ms: AtomicU64,
-    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    master: Mutex<Option<OwnedPtyMaster>>,
     pid: Option<i32>,
     terminal: Mutex<TerminalModel>,
     scrollback: Mutex<BoundedBytes>,
@@ -713,14 +1061,12 @@ struct ShellState {
 }
 
 impl ShellState {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         id: ShellId,
         name: String,
         cwd: PathBuf,
         shell_path: PathBuf,
-        master: Box<dyn MasterPty + Send>,
-        writer: Box<dyn Write + Send>,
+        master: OwnedPtyMaster,
         pid: Option<i32>,
         config: &Config,
     ) -> Self {
@@ -734,7 +1080,6 @@ impl ShellState {
             created_at_ms: now,
             last_active_at_ms: AtomicU64::new(now),
             master: Mutex::new(Some(master)),
-            writer: Mutex::new(Some(writer)),
             pid,
             terminal: Mutex::new(TerminalModel::new(config.limits.snapshot_bytes_per_shell)),
             scrollback: Mutex::new(BoundedBytes::new(config.limits.scrollback_bytes_per_shell)),
@@ -742,6 +1087,50 @@ impl ShellState {
             attach: Mutex::new(None),
             seq: AtomicU64::new(0),
         }
+    }
+
+    /// Re-create a ShellState from on-disk metadata + replay files after a
+    /// hot-upgrade adopted the PTY master fd. The reader thread will
+    /// resume scribbling into the same TerminalModel / scrollback / event
+    /// ring as soon as we hand the state back to the registry.
+    fn adopt(
+        id: ShellId,
+        metadata: StateMetadata,
+        master: OwnedPtyMaster,
+        pid: Option<i32>,
+        paths: &RuntimePaths,
+        config: &Config,
+    ) -> anyhow::Result<Self> {
+        let mut terminal = TerminalModel::new(config.limits.snapshot_bytes_per_shell);
+        if let Ok(snapshot) = fs::read(paths.snapshot(&id)) {
+            terminal.process(&snapshot);
+        }
+        let mut scrollback = BoundedBytes::new(config.limits.scrollback_bytes_per_shell);
+        if let Ok(bytes) = fs::read(paths.scrollback(&id)) {
+            scrollback.append(&bytes);
+        }
+        let mut events = EventRing::new(config.limits.event_ring_bytes_per_shell);
+        if let Ok(bytes) = fs::read(paths.events(&id)) {
+            events.append(0, &bytes);
+        }
+        let created_at_ms = metadata.created_at_ms.min(u128::from(u64::MAX)) as u64;
+        let last_active_ms = metadata.last_active_at_ms.min(u128::from(u64::MAX)) as u64;
+        Ok(Self {
+            id,
+            name: Mutex::new(metadata.name),
+            status: Mutex::new(metadata.status),
+            shell_path: PathBuf::from(metadata.shell_path),
+            cwd: Mutex::new(PathBuf::from(metadata.cwd)),
+            created_at_ms,
+            last_active_at_ms: AtomicU64::new(last_active_ms),
+            master: Mutex::new(Some(master)),
+            pid,
+            terminal: Mutex::new(terminal),
+            scrollback: Mutex::new(scrollback),
+            events: Mutex::new(events),
+            attach: Mutex::new(None),
+            seq: AtomicU64::new(0),
+        })
     }
 
     fn attach(
@@ -817,12 +1206,11 @@ impl ShellState {
     }
 
     fn write_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        let mut writer = self.writer.lock();
-        let Some(writer) = writer.as_mut() else {
-            bail!("shell writer is closed");
+        let master = self.master.lock();
+        let Some(master) = master.as_ref() else {
+            bail!("shell pty is closed");
         };
-        writer.write_all(bytes)?;
-        writer.flush()?;
+        master.write_all(bytes)?;
         Ok(())
     }
 
@@ -831,12 +1219,7 @@ impl ShellState {
         let Some(master) = master.as_ref() else {
             bail!("shell pty is closed");
         };
-        master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        master.resize(cols, rows)?;
         Ok(())
     }
 
@@ -876,7 +1259,6 @@ impl ShellState {
     }
 
     fn close_handles(&self) {
-        *self.writer.lock() = None;
         *self.master.lock() = None;
     }
 

@@ -10,6 +10,13 @@ pub enum LiveshMode {
         state_json_fd: Option<i32>,
         cwd: Option<PathBuf>,
     },
+    /// User-driven escape from a transparent (fallback) shell back into a
+    /// managed shell. Behaves like New but never falls back if the daemon
+    /// is unreachable — the user explicitly wants managed mode.
+    Upgrade {
+        name: Option<String>,
+        cwd: Option<PathBuf>,
+    },
     Open {
         id: ShellId,
     },
@@ -25,6 +32,7 @@ pub enum LiveshctlMode {
     Kill { id: ShellId },
     Gc,
     Status,
+    UpgradeDaemon { binary: Option<PathBuf> },
     Help,
     Version,
 }
@@ -33,11 +41,19 @@ pub fn parse_livesh<I>(args: I) -> anyhow::Result<LiveshMode>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     let _program = args.next();
     let mut name = None;
     let mut state_json_fd = None;
     let mut cwd: Option<PathBuf> = None;
+
+    let upgrade = matches!(
+        args.peek().map(|a| a.to_string_lossy().into_owned()),
+        Some(ref s) if s == "upgrade"
+    );
+    if upgrade {
+        args.next();
+    }
 
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy();
@@ -54,7 +70,7 @@ where
                 let value = args.next().context("--name requires a value")?;
                 name = Some(value.to_string_lossy().to_string());
             }
-            "--state-json-fd" => {
+            "--state-json-fd" if !upgrade => {
                 let value = args
                     .next()
                     .context("--state-json-fd requires a file descriptor")?;
@@ -72,11 +88,15 @@ where
         }
     }
 
-    Ok(LiveshMode::New {
-        name,
-        state_json_fd,
-        cwd,
-    })
+    if upgrade {
+        Ok(LiveshMode::Upgrade { name, cwd })
+    } else {
+        Ok(LiveshMode::New {
+            name,
+            state_json_fd,
+            cwd,
+        })
+    }
 }
 
 pub fn parse_liveshctl<I>(args: I) -> anyhow::Result<LiveshctlMode>
@@ -116,16 +136,20 @@ where
         }
         "gc" => Ok(LiveshctlMode::Gc),
         "status" => Ok(LiveshctlMode::Status),
+        "upgrade-daemon" => {
+            let binary = args.next().map(PathBuf::from);
+            Ok(LiveshctlMode::UpgradeDaemon { binary })
+        }
         unknown => bail!("unknown liveshctl command: {unknown}"),
     }
 }
 
 pub fn livesh_help() -> &'static str {
-    "usage: livesh [--name <name>] [--cwd <dir>] [--state-json-fd <fd>]\n       livesh --open <sh_id>\n       livesh --real\n"
+    "usage: livesh [--name <name>] [--cwd <dir>] [--state-json-fd <fd>]\n       livesh upgrade [--name <name>] [--cwd <dir>]\n       livesh --open <sh_id>\n       livesh --real\n"
 }
 
 pub fn liveshctl_help() -> &'static str {
-    "usage: liveshctl list [--json]\n       liveshctl rename <sh_id> <name>\n       liveshctl kill <sh_id>\n       liveshctl gc\n       liveshctl status\n"
+    "usage: liveshctl list [--json]\n       liveshctl rename <sh_id> <name>\n       liveshctl kill <sh_id>\n       liveshctl gc\n       liveshctl status\n       liveshctl upgrade-daemon [<new-binary>]\n"
 }
 
 #[cfg(test)]

@@ -4,8 +4,10 @@ pub mod client;
 pub mod daemon;
 pub mod daemon_spawn;
 pub mod framing;
+pub mod pty_master;
 pub mod raw_mode;
 pub mod state_json;
+pub mod takeover;
 pub mod tty;
 
 pub const EXIT_USAGE: i32 = 64;
