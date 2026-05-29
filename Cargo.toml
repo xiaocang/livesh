@@ -13,7 +13,6 @@ version = "0.1.0"
 authors = ["Johnny Wang"]
 repository = "https://github.com/xiaocang/livesh"
 homepage = "https://github.com/xiaocang/livesh"
-readme = "README.md"
 rust-version = "1.85"
 keywords = ["shell", "pty", "terminal", "session", "daemon"]
 categories = ["command-line-utilities", "development-tools"]
