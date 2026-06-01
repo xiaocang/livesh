@@ -20,6 +20,13 @@ pub struct StateMetadata {
     pub daemon_id: String,
     pub created_at_ms: u128,
     pub last_active_at_ms: u128,
+    /// Last known PTY dimensions, used to rebuild the terminal grid at the
+    /// correct size after a daemon hot-upgrade. Older metadata files predate
+    /// these fields and deserialize to 0 (treated as "unknown" by `adopt`).
+    #[serde(default)]
+    pub rows: u16,
+    #[serde(default)]
+    pub cols: u16,
 }
 
 pub fn read_metadata(path: &Path) -> anyhow::Result<StateMetadata> {

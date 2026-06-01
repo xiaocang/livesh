@@ -545,6 +545,8 @@ impl ShellRegistry {
             shell_path,
             master,
             pid,
+            cols,
+            rows,
             &self.config,
         ));
 
@@ -829,6 +831,7 @@ impl ShellRegistry {
     }
 
     fn persist_metadata(&self, state: &ShellState) -> anyhow::Result<()> {
+        let (rows, cols) = *state.size.lock();
         let metadata = StateMetadata {
             schema: 1,
             id: state.id.clone(),
@@ -839,6 +842,8 @@ impl ShellRegistry {
             daemon_id: self.daemon_id.clone(),
             created_at_ms: state.created_at_ms as u128,
             last_active_at_ms: state.last_active_at_ms.load(Ordering::Relaxed) as u128,
+            rows,
+            cols,
         };
         write_metadata(&self.paths.metadata(&state.id), &metadata)
     }
@@ -1054,6 +1059,10 @@ struct ShellState {
     master: Mutex<Option<OwnedPtyMaster>>,
     pid: Option<i32>,
     terminal: Mutex<TerminalModel>,
+    /// Current PTY dimensions as (rows, cols). Kept in sync with the grid and
+    /// persisted to metadata so a hot-upgrade can rebuild the grid at the
+    /// matching size.
+    size: Mutex<(u16, u16)>,
     scrollback: Mutex<BoundedBytes>,
     events: Mutex<EventRing>,
     attach: Mutex<Option<Attach>>,
@@ -1068,6 +1077,8 @@ impl ShellState {
         shell_path: PathBuf,
         master: OwnedPtyMaster,
         pid: Option<i32>,
+        cols: u16,
+        rows: u16,
         config: &Config,
     ) -> Self {
         let now = now_ms();
@@ -1081,7 +1092,8 @@ impl ShellState {
             last_active_at_ms: AtomicU64::new(now),
             master: Mutex::new(Some(master)),
             pid,
-            terminal: Mutex::new(TerminalModel::new(config.limits.snapshot_bytes_per_shell)),
+            terminal: Mutex::new(TerminalModel::new(rows, cols)),
+            size: Mutex::new((rows, cols)),
             scrollback: Mutex::new(BoundedBytes::new(config.limits.scrollback_bytes_per_shell)),
             events: Mutex::new(EventRing::new(config.limits.event_ring_bytes_per_shell)),
             attach: Mutex::new(None),
@@ -1101,7 +1113,11 @@ impl ShellState {
         paths: &RuntimePaths,
         config: &Config,
     ) -> anyhow::Result<Self> {
-        let mut terminal = TerminalModel::new(config.limits.snapshot_bytes_per_shell);
+        // Older metadata predates persisted dimensions (deserializes to 0);
+        // fall back to a conventional 80x24 until the next attach resizes us.
+        let rows = if metadata.rows == 0 { 24 } else { metadata.rows };
+        let cols = if metadata.cols == 0 { 80 } else { metadata.cols };
+        let mut terminal = TerminalModel::new(rows, cols);
         if let Ok(snapshot) = fs::read(paths.snapshot(&id)) {
             terminal.process(&snapshot);
         }
@@ -1126,6 +1142,7 @@ impl ShellState {
             master: Mutex::new(Some(master)),
             pid,
             terminal: Mutex::new(terminal),
+            size: Mutex::new((rows, cols)),
             scrollback: Mutex::new(scrollback),
             events: Mutex::new(events),
             attach: Mutex::new(None),
@@ -1215,11 +1232,15 @@ impl ShellState {
     }
 
     fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
-        let master = self.master.lock();
-        let Some(master) = master.as_ref() else {
-            bail!("shell pty is closed");
-        };
-        master.resize(cols, rows)?;
+        {
+            let master = self.master.lock();
+            let Some(master) = master.as_ref() else {
+                bail!("shell pty is closed");
+            };
+            master.resize(cols, rows)?;
+        }
+        self.terminal.lock().set_size(rows, cols);
+        *self.size.lock() = (rows, cols);
         Ok(())
     }
 
