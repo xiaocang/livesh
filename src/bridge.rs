@@ -53,15 +53,31 @@ enum BridgeEnd {
 pub async fn open_and_bridge(client: Client, id: ShellId) -> anyhow::Result<i32> {
     let size = tty::current_size();
     let snapshot = client.open_shell(id.clone(), size.cols, size.rows, true).await?;
-    bridge_snapshot(client, id, snapshot.attach_id, snapshot.screen_bytes).await
+    bridge_snapshot(
+        client,
+        id,
+        snapshot.name,
+        snapshot.attach_id,
+        snapshot.screen_bytes,
+    )
+    .await
 }
 
 pub async fn bridge_snapshot(
     client: Client,
     id: ShellId,
+    name: String,
     attach_id: AttachId,
     screen_bytes: Vec<u8>,
 ) -> anyhow::Result<i32> {
+    // Title the process for `ps`/`w`. The head (name + short id) is fixed; the
+    // cwd is filled in by `output_loop` as `CwdChanged` arrives, so the title
+    // tracks where the shell actually is.
+    let default_name = crate::config::Config::load()
+        .map(|c| c.default_name)
+        .unwrap_or_else(|_| "shell".to_string());
+    let title_head = title_head(&name, &id, &default_name);
+    crate::proctitle::set_title(&title_head);
     let raw_guard = if tty::stdin_stdout_are_tty() {
         Some(RawModeGuard::enter()?)
     } else {
@@ -84,7 +100,7 @@ pub async fn bridge_snapshot(
     };
 
     let end = loop {
-        match output_loop(current.client.clone(), current.attach_id.clone()).await {
+        match output_loop(current.client.clone(), current.attach_id.clone(), &title_head).await {
             Outcome::Exited(code) => break BridgeEnd::Exit(code),
             Outcome::Failed(err) => break BridgeEnd::Error(err),
             Outcome::Disconnected => match reconnect(&id).await {
@@ -128,6 +144,46 @@ pub async fn bridge_snapshot(
             shell_resolve::exec_real_shell().map(|()| 0)
         }
     }
+}
+
+/// Longest shell name shown in the title; longer names are truncated with `...`.
+const MAX_TITLE_NAME: usize = 20;
+
+/// Fixed part of the `ps`/`w` process title, e.g. `livesh [api] (sh_4cceeab1)`.
+/// The id is shortened to `sh_` plus the first 8 hex chars — enough to match
+/// `liveshctl ls` without bloating the line. The `[name]` segment is dropped
+/// when the shell still carries the default name (it adds no information), and
+/// long names are truncated. `output_loop` appends the live cwd.
+fn title_head(name: &str, id: &ShellId, default_name: &str) -> String {
+    let short_id: String = id.as_str().chars().take("sh_".len() + 8).collect();
+    if name.is_empty() || name == default_name {
+        format!("livesh ({short_id})")
+    } else {
+        format!("livesh [{}] ({short_id})", truncate(name, MAX_TITLE_NAME))
+    }
+}
+
+/// Truncate to at most `max` chars, marking elision with a trailing `...`.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(3)).collect();
+    format!("{head}...")
+}
+
+/// Render a cwd for the process title, collapsing `$HOME` to `~`.
+fn display_cwd(cwd: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::Path::new(&home);
+        if let Ok(rest) = cwd.strip_prefix(home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    cwd.display().to_string()
 }
 
 fn paint(bytes: &[u8]) -> anyhow::Result<()> {
@@ -179,7 +235,7 @@ fn spawn_resize_task(target_rx: watch::Receiver<Target>) -> anyhow::Result<JoinH
     }))
 }
 
-async fn output_loop(client: Client, attach_id: AttachId) -> Outcome {
+async fn output_loop(client: Client, attach_id: AttachId, title_head: &str) -> Outcome {
     loop {
         let msg = match client.recv().await {
             Ok(msg) => msg,
@@ -212,6 +268,8 @@ async fn output_loop(client: Client, attach_id: AttachId) -> Outcome {
                 cwd,
             } if msg_attach == attach_id => {
                 let _ = std::env::set_current_dir(&cwd);
+                // Keep the `ps`/`w` title pointed at the shell's current dir.
+                crate::proctitle::set_title(&format!("{title_head} {}", display_cwd(&cwd)));
             }
             ServerMsg::Error { code, message } => {
                 return Outcome::Failed(ServerError { code, message }.into());

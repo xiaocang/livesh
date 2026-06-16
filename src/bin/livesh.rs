@@ -66,7 +66,14 @@ async fn open_or_recreate(id: ShellId) -> anyhow::Result<i32> {
     let size = tty::current_size();
     match client.open_shell(id.clone(), size.cols, size.rows, true).await {
         Ok(snapshot) => {
-            bridge::bridge_snapshot(client, id, snapshot.attach_id, snapshot.screen_bytes).await
+            bridge::bridge_snapshot(
+                client,
+                id,
+                snapshot.name,
+                snapshot.attach_id,
+                snapshot.screen_bytes,
+            )
+            .await
         }
         Err(err) if is_not_found(&err) => {
             eprintln!(
